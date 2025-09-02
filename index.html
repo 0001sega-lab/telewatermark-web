@@ -44,122 +44,161 @@
   <div id="err" class="error"></div>
 </main>
 
-<!-- UMD-версия ffmpeg.wasm (без ES-модулей) -->
+<!-- UMD ffmpeg -->
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/umd/ffmpeg.js"></script>
 <script>
-  (function(){
-    const $file = document.getElementById('file');
-    const $go   = document.getElementById('go');
-    const $dl   = document.getElementById('dl');
-    const $log  = document.getElementById('progress');
-    const $wm   = document.getElementById('wmText');
-    const $err  = document.getElementById('err');
+(function(){
+  const $file = document.getElementById('file');
+  const $go   = document.getElementById('go');
+  const $dl   = document.getElementById('dl');
+  const $log  = document.getElementById('progress');
+  const $wm   = document.getElementById('wmText');
+  const $err  = document.getElementById('err');
 
-    function setLog(t){ $log.textContent = t || ''; }
-    function setErr(t){ $err.textContent = t || ''; }
+  function setLog(t){ $log.textContent = (t||''); }
+  function appendLog(t){ $log.textContent += (t ? '\n'+t : ''); }
+  function setErr(t){ $err.textContent = (t||''); }
 
-    // 1) Фикс выбора файла: включаем кнопку, если файл реально есть
-    function updateUIAfterPick() {
+  // Активируем кнопку после реального выбора
+  function updateUIAfterPick(){
+    const f = $file.files && $file.files[0];
+    if (f){ setErr(''); setLog(`Файл: ${f.name} • ${(f.size/1048576).toFixed(1)} МБ`); $go.disabled=false; $dl.style.display='none'; }
+    else { setLog('Файл не выбран'); $go.disabled=true; }
+  }
+  $file.addEventListener('change', ()=>{ updateUIAfterPick(); setTimeout(updateUIAfterPick,300); });
+  $file.addEventListener('input',  updateUIAfterPick);
+  setInterval(updateUIAfterPick, 1000);
+
+  // ------- ❶ Рисуем watermark в Canvas → PNG (прозрачный фон) -------
+  function makeWatermarkPng(text){
+    // Базовые параметры
+    const fontPx = 28; // как раньше fontsize
+    const padX = 12, padY = 8; // внутренние отступы
+    const shadow = true;
+
+    // Создаём временный canvas для измерения текста
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    ctx.font = `bold ${fontPx}px -apple-system,system-ui,Segoe UI,Roboto,Arial`;
+    const metrics = ctx.measureText(text);
+    const w = Math.ceil(metrics.width) + padX*2;
+    const h = Math.ceil(fontPx*1.6) + padY*2;
+    c.width = w; c.height = h;
+
+    // Перерисовываем с реальными размерами
+    const ctx2 = c.getContext('2d');
+    ctx2.font = `bold ${fontPx}px -apple-system,system-ui,Segoe UI,Roboto,Arial`;
+    ctx2.textBaseline = 'middle';
+    ctx2.textAlign = 'left';
+
+    // Полупрозрачный белый + «обводка» тенью (имитация border)
+    if (shadow){
+      ctx2.shadowColor = 'rgba(0,0,0,0.7)';
+      ctx2.shadowBlur = 4;
+      ctx2.shadowOffsetX = 0;
+      ctx2.shadowOffsetY = 0;
+    }
+    ctx2.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx2.fillText(text, padX, h/2);
+
+    // В PNG (Uint8Array)
+    const dataUrl = c.toDataURL('image/png');
+    const bin = atob(dataUrl.split(',')[1]);
+    const u8 = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) u8[i] = bin.charCodeAt(i);
+    return { u8, w, h };
+  }
+
+  // ------- ❷ ffmpeg: single-thread core + логгер в UI -------
+  const { createFFmpeg, fetchFile } = window.FFmpeg;
+  const ffmpeg = createFFmpeg({
+    corePath: 'https://unpkg.com/@ffmpeg/core-st@0.12.6/dist/ffmpeg-core.js',
+    log: true,
+    logger: ({ type, message }) => {
+      // Показываем ключевые вещи в UI
+      if (type === 'fferr' && /Error|error|Invalid|failed/i.test(message)) setErr(message);
+      // Чтобы не залить экран, выводим только время от времени
+      if (/Opening|frame=|time=|speed=|kb\/s|video:|audio:/i.test(message)) appendLog(message);
+    },
+    progress: ({ ratio }) => {
+      const pct = Math.max(0, Math.min(1, ratio||0))*100;
+      setLog(`Обработка: ${pct.toFixed(1)}%`);
+    }
+  });
+
+  // Подхват ?wm= из URL
+  try {
+    const v = new URLSearchParams(location.search).get('wm');
+    if (v) $wm.value = v;
+  } catch(e){}
+
+  async function startProcess(){
+    try{
       const f = $file.files && $file.files[0];
-      if (f) {
-        setErr('');
-        setLog(`Файл выбран: ${f.name} • ${(f.size/1048576).toFixed(1)} МБ`);
-        $go.disabled = false;
-        $dl.style.display = 'none';
-      } else {
-        setLog('Файл не выбран');
-        $go.disabled = true;
-      }
+      if (!f){ setErr('Файл отсутствует (input.files[0] пустой)'); return; }
+
+      $go.disabled = true; setErr(''); setLog('Загрузка модуля…');
+
+      if (!ffmpeg.isLoaded()) await ffmpeg.load();
+
+      // Пишем видео
+      setLog('Чтение видео…');
+      await ffmpeg.FS('writeFile', 'in.mp4', await fetchFile(f));
+
+      // Пишем watermark PNG (вместо drawtext)
+      const textRaw = ($wm.value || '@yourbrand');
+      const textSafe = textRaw.replace(/\s+/g, ' ').trim();
+      const { u8: wmPng } = makeWatermarkPng(textSafe);
+      await ffmpeg.FS('writeFile', 'wm.png', wmPng);
+
+      // ------- ❸ filter_complex: scale→pad→format, затем overlay с прыжками по таймлайну -------
+      // Позиции каждые 3с: 0 ЛВ → 1 ПН → 2 Центр → 3 ПН → повтор
+      const overlayXY =
+        "x='if(eq(floor(mod(t/3,4)),0),10,if(eq(floor(mod(t/3,4)),1),W-w-10,if(eq(floor(mod(t/3,4)),2),(W-w)/2,W-w-10)))':" +
+        "y='if(eq(floor(mod(t/3,4)),0),10,if(eq(floor(mod(t/3,4)),1),H-h-10,if(eq(floor(mod(t/3,4)),2),(H-h)/2,H-h-10)))'";
+
+      const filter =
+        "[0:v]scale='min(1280,iw)':'-2':flags=bicubic," +
+        "pad=1280:720:(1280-iw*min(1280/iw\\,720/ih))/2:(720-ih*min(1280/iw\\,720/ih))/2:color=black," +
+        "format=rgba[v];" +
+        "[1:v]format=rgba[wm];" +
+        "[v][wm]overlay=" + overlayXY + "[outv]";
+
+      // Команда: подаём два входа (видео и wm.png), собираем в 720p + aac
+      setLog('Перекодирование видео…');
+      await ffmpeg.run(
+        '-i','in.mp4',
+        '-i','wm.png',
+        '-filter_complex', filter,
+        '-map','[outv]',
+        '-map','0:a?',           // возьми аудио из исходника, если есть
+        '-c:v','libx264','-preset','veryfast','-crf','23',
+        '-c:a','aac','-b:a','128k',
+        'out.mp4'
+      );
+
+      setLog('Формирование файла…');
+      const data = ffmpeg.FS('readFile', 'out.mp4');
+      const url = URL.createObjectURL(new Blob([data.buffer], { type:'video/mp4' }));
+      $dl.href = url; $dl.style.display = 'inline-block';
+      setLog('Готово! Скачайте MP4 ниже.');
+    }catch(e){
+      console.error(e);
+      setErr('Ошибка: ' + (e?.message || e));
+      if (typeof e === 'string') appendLog(e);
+      alert('Произошла ошибка. Попробуйте более короткое видео или откройте во внешнем браузере.');
+    }finally{
+      $go.disabled = false;
     }
-    function delayed(){ setTimeout(updateUIAfterPick, 300); }
+  }
 
-    $file.addEventListener('change', ()=>{ updateUIAfterPick(); delayed(); });
-    $file.addEventListener('input',  ()=>{ updateUIAfterPick(); });
-    document.addEventListener('change', (e)=>{ if (e.target === $file) updateUIAfterPick(); });
-    setInterval(updateUIAfterPick, 1000); // iOS иногда отдаёт файл с задержкой
-
-    // 2) Старт обработки (с диагностикой)
-    async function startProcess(){
-      try {
-        const f = $file.files && $file.files[0];
-        if (!f) {
-          setErr('Файл отсутствует: input.files[0] пустой');
-          alert('Похоже, файл не передан браузеру. Попробуйте выбрать заново или открыть во внешнем браузере.');
-          return;
-        }
-        $go.disabled = true;
-        setErr('');
-        setLog('Загрузка модуля…');
-
-        // ffmpeg (UMD) уже подключен <script src=...>; берём API из window.FFmpeg
-        const { createFFmpeg, fetchFile } = window.FFmpeg;
-        const ffmpeg = window._ffmpegInstance || createFFmpeg({
-          corePath: 'https://unpkg.com/@ffmpeg/core-st@0.12.6/dist/ffmpeg-core.js',
-          log: true,
-          progress: ({ ratio }) => {
-            const pct = Math.max(0, Math.min(1, ratio || 0)) * 100;
-            setLog('Обработка: ' + pct.toFixed(1) + '%');
-          },
-        });
-        window._ffmpegInstance = ffmpeg;
-
-        if (!ffmpeg.isLoaded()) {
-          await ffmpeg.load();
-          const fontResp = await fetch('https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts@version_2_37/ttf/DejaVuSans-Bold.ttf');
-          if (!fontResp.ok) throw new Error('Не удалось загрузить шрифт');
-          const fontBuf = await fontResp.arrayBuffer();
-          await ffmpeg.FS('writeFile', 'font.ttf', new Uint8Array(fontBuf));
-        }
-
-        setLog('Чтение видео…');
-        await ffmpeg.FS('writeFile', 'in.mp4', await fetchFile(f));
-
-        const text = ($wm.value || '@yourbrand').replace(/:/g,'\\:').replace(/'/g,"\\'");
-        const DRAW =
-          "drawtext=fontfile='font.ttf':" +
-          "text='" + text + "':fontsize=28:fontcolor=white:alpha=0.65:" +
-          "borderw=3:bordercolor=black@0.7:" +
-          "x='if(eq(floor(mod(t/3,4)),0),10,if(eq(floor(mod(t/3,4)),1),W-tw-10,if(eq(floor(mod(t/3,4)),2),(W-tw)/2,W-tw-10)))':" +
-          "y='if(eq(floor(mod(t/3,4)),0),10,if(eq(floor(mod(t/3,4)),1),H-th-10,if(eq(floor(mod(t/3,4)),2),(H-th)/2,H-th-10)))'";
-
-        const vf =
-          "scale='min(1280,iw)':'-2':flags=bicubic," +
-          "pad=1280:720:(1280-iw*min(1280/iw\\,720/ih))/2:(720-ih*min(1280/iw\\,720/ih))/2:color=black," +
-          "format=yuv420p," + DRAW;
-
-        setLog('Перекодирование видео…');
-        await ffmpeg.run(
-          '-i','in.mp4',
-          '-vf', vf,
-          '-c:v','libx264','-preset','veryfast','-crf','23',
-          '-c:a','aac','-b:a','128k',
-          'out.mp4'
-        );
-
-        setLog('Формирование файла…');
-        const data = ffmpeg.FS('readFile', 'out.mp4');
-        const blob = new Blob([data.buffer], { type: 'video/mp4' });
-        const url = URL.createObjectURL(blob);
-        $dl.href = url;
-        $dl.style.display = 'inline-block';
-        setLog('Готово! Скачайте MP4 ниже.');
-      } catch (e) {
-        console.error(e);
-        setErr('Ошибка: ' + (e?.message || e));
-        setLog('');
-        alert('Произошла ошибка. Попробуйте укоротить видео или открыть во внешнем браузере.');
-      } finally {
-        $go.disabled = false;
-      }
-    }
-
-    // 3) На всякий — вешаем и на pointerdown, и на touchstart, и на click
-    ['pointerdown','touchstart','click'].forEach(ev=>{
-      document.getElementById('go').addEventListener(ev, (e)=>{ e.preventDefault(); startProcess(); }, {passive:false});
-    });
-
-  })();
+  // Страхуемся: навешиваем все популярные события на кнопку
+  ['pointerdown','touchstart','click'].forEach(ev=>{
+    $go.addEventListener(ev, (e)=>{ e.preventDefault(); startProcess(); }, {passive:false});
+  });
+})();
 </script>
+
 
 
 <noscript>Для работы нужен включённый JavaScript.</noscript>
