@@ -4,24 +4,26 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Сжатие 720p + водяной знак</title>
 <style>
+  * { -webkit-tap-highlight-color: transparent; }
   body{font-family:system-ui,Arial,sans-serif;background:#0b0c10;color:#e6e6e6;margin:0}
   header{padding:16px;text-align:center;background:#111217}
-  main{padding:16px;max-width:680px;margin:0 auto}
+  main{padding:16px;max-width:680px;margin:0 auto; position:relative;}
   .row{margin:12px 0;display:flex;gap:8px;align-items:center}
-  input[type=file]{display:block;width:100%;padding:10px;border-radius:8px;border:1px solid #2a2b32;background:#17181f;color:#fff}
-  .row input[type=text]{flex:1;padding:10px 12px;border-radius:8px;border:1px solid #2a2b32;background:#17181f;color:#fff}
-  .row button{padding:12px 16px;border:0;border-radius:8px;background:#30a46c;color:#0b0c10;font-weight:700;cursor:pointer}
+  input[type=file]{display:block;width:100%;padding:10px;border-radius:8px;border:1px solid #2a2b32;background:#17181f;color:#fff; pointer-events:auto}
+  .row input[type=text]{flex:1;padding:10px 12px;border-radius:8px;border:1px solid #2a2b32;background:#17181f;color:#fff; pointer-events:auto}
+  .row button{padding:12px 16px;border:0;border-radius:8px;background:#30a46c;color:#0b0c10;font-weight:700;cursor:pointer; pointer-events:auto}
   .row button[disabled]{opacity:.5;cursor:not-allowed}
   .log{margin-top:12px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;background:#0f1115;border:1px solid #252733;padding:10px;border-radius:8px;min-height:80px}
   .error{margin-top:8px;color:#ff7b72;font-size:13px}
   .download{display:inline-block;margin-top:12px;background:#1f6feb;color:#fff;padding:12px 16px;border-radius:8px;text-decoration:none}
   .hint{opacity:.8;font-size:13px}
+  #diag{margin-bottom:8px; font-size:12px; opacity:.85}
 </style>
 </head>
 <body>
 <header><h1>Сжать видео до 720p + водяной знак</h1></header>
 <main>
-  <div id="diag" style="opacity:.8;font-size:12px;margin-bottom:8px"></div>
+  <div id="diag">Диагностика: …</div>
 
   <div class="row">
     <input id="file" type="file" accept="video/*,video/mp4,video/quicktime">
@@ -33,15 +35,16 @@
   </div>
 
   <div class="row">
-    <button id="go" disabled>Начать обработку</button>
+    <button id="go" type="button">Начать обработку</button>
   </div>
 
   <div id="progress" class="log"></div>
   <a id="dl" class="download" download="output_720p_watermarked.mp4" style="display:none">Скачать готовый MP4</a>
-  <p class="hint">Если кнопка не активируется в мини-приложении — воспользуйтесь кнопкой бота «Открыть во внешнем браузере».</p>
+  <p class="hint">Если кнопка не реагирует в мини-приложении — откройте «во внешнем браузере» из сообщения бота.</p>
   <div id="err" class="error"></div>
 </main>
 
+<!-- UMD-версия ffmpeg.wasm (без ES-модулей) -->
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/umd/ffmpeg.js"></script>
 <script>
 (function(){
@@ -53,7 +56,16 @@
   const $err  = document.getElementById('err');
   const $diag = document.getElementById('diag');
 
-  $diag.textContent = 'UA: ' + navigator.userAgent + ' | iframe: ' + (function(){try{return self!==top}catch(e){return true}})();
+  // Диагностика окружения + событий по кнопке
+  let eventsFired = [];
+  function pushEv(name){ eventsFired.push(name); $diag.textContent =
+    'UA: ' + navigator.userAgent +
+    ' | iframe: ' + (function(){try{return self!==top}catch(e){return true}})() +
+    ' | button events: ' + eventsFired.join(', ');
+  }
+  ['pointerdown','touchstart','click'].forEach(ev=>{
+    $go.addEventListener(ev, ()=>pushEv(ev), {passive:true});
+  });
 
   function setLog(t){ $log.textContent = t || ''; }
   function setErr(t){ $err.textContent = t || ''; }
@@ -63,19 +75,21 @@
     if (f) {
       setErr('');
       setLog(`Файл: ${f.name || 'video'} • ${(f.size/1048576).toFixed(1)} МБ`);
-      $go.disabled = false;
       $dl.style.display = 'none';
     } else {
-      $go.disabled = true;
+      setLog('Файл не выбран');
     }
   }
   function delayed(){ setTimeout(updateUIAfterPick, 300); }
 
-  // максимально совместимые слушатели
+  // максимально совместимые слушатели для выбора файла
   $file.onchange = ()=>{ updateUIAfterPick(); delayed(); };
   $file.oninput  = ()=>{ updateUIAfterPick(); };
   document.addEventListener('change', (e)=>{ if(e.target===$file) { updateUIAfterPick(); } });
-  setInterval(updateUIAfterPick, 1000); // на случай «ленивого» вебвью
+  setInterval(updateUIAfterPick, 1000);
+
+  // Подхват ?wm= из URL
+  try { const wm = new URLSearchParams(location.search).get('wm'); if (wm) $wm.value = wm; } catch(e){}
 
   const { createFFmpeg, fetchFile } = window.FFmpeg;
   const ffmpeg = createFFmpeg({
@@ -87,14 +101,12 @@
     },
   });
 
-  // подхват ?wm= из URL
-  try { const wm = new URLSearchParams(location.search).get('wm'); if (wm) $wm.value = wm; } catch(e){}
-
-  $go.addEventListener('click', async () => {
+  // Явно запускаем обработку на любой из событий кнопки (помогает там, где click не приходит)
+  async function startProcess(){
     try {
       const file = $file.files && $file.files[0];
-      if (!file) return alert('Выберите видео');
-      $go.disabled = true; setLog('Загрузка модуля…'); setErr('');
+      if (!file) { setErr('Сначала выберите видео'); return; }
+      $go.disabled = true; setErr(''); setLog('Загрузка модуля…');
 
       if (!ffmpeg.isLoaded()) {
         await ffmpeg.load();
@@ -140,10 +152,14 @@
       console.error(e);
       setErr('Ошибка: ' + (e?.message || e));
       setLog('');
-      alert('Произошла ошибка. Попробуйте укоротить видео или обновить Telegram/браузер.');
+      alert('Произошла ошибка. Попробуйте укоротить видео или открыть во внешнем браузере.');
     } finally {
       $go.disabled = false;
     }
+  }
+
+  ['pointerdown','touchstart','click'].forEach(ev=>{
+    $go.addEventListener(ev, (e)=>{ e.preventDefault(); startProcess(); }, {passive:false});
   });
 })();
 </script>
