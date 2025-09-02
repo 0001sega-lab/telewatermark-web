@@ -20,11 +20,14 @@
     .error { margin-top:8px; color:#ff7b72; font-size:13px; }
     .download { display:inline-block; margin-top:12px; background:#1f6feb; color:#fff; padding:12px 16px; border-radius:8px; text-decoration:none; }
     .hint { opacity:.8; font-size:13px; }
+    .diag { margin-top:8px; font-size:12px; opacity:.8; }
   </style>
 </head>
 <body>
   <header><h1>Сжать видео до 720p + водяной знак</h1></header>
   <main>
+    <div class="diag" id="diag">Загрузка…</div>
+
     <label class="filepick">
       <input id="file" type="file" accept="video/*" capture="environment" />
       <span>Выбрать видео</span>
@@ -41,12 +44,20 @@
 
     <div id="progress" class="log"></div>
     <a id="dl" class="download" download="output_720p_watermarked.mp4" style="display:none">Скачать готовый MP4</a>
-    <p class="hint">Работает прямо в браузере телефона (Telegram WebApp). Длинные ролики требуют больше времени/памяти.</p>
+    <p class="hint">Работает прямо в Telegram WebApp. Если видите «белый экран», проверьте, что страница позволена к встраиванию (см. файл _headers).</p>
     <div id="err" class="error"></div>
   </main>
 
-  <!-- UMD-версия ffmpeg.wasm (без ES-модулей) -->
+  <!-- UMD-версия ffmpeg.wasm -->
   <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/umd/ffmpeg.js"></script>
+  <script>
+    // Диагностика окружения
+    (function(){
+      const $diag = document.getElementById('diag');
+      const inIframe = (function(){ try { return window.self !== window.top; } catch(e){ return true; }})();
+      $diag.textContent = 'UA: ' + navigator.userAgent + ' | iframe: ' + inIframe;
+    })();
+  </script>
   <script>
     (function(){
       const $file = document.getElementById('file');
@@ -56,10 +67,7 @@
       const $wm   = document.getElementById('wmText');
       const $err  = document.getElementById('err');
 
-      // Берём API из глобального объекта FFmpeg (UMD)
       const { createFFmpeg, fetchFile } = window.FFmpeg;
-
-      // Используем single-thread ядро (без SharedArrayBuffer/COOP/COEP)
       const ffmpeg = createFFmpeg({
         corePath: 'https://unpkg.com/@ffmpeg/core-st@0.12.6/dist/ffmpeg-core.js',
         log: true,
@@ -72,11 +80,10 @@
       function setLog(t){ $log.textContent = t || ''; }
       function setErr(t){ $err.textContent = t || ''; }
 
-      // Покажем любые ошибки прямо на странице
       window.addEventListener('error', e => setErr('JS error: ' + (e.message || e)));
       window.addEventListener('unhandledrejection', e => setErr('Promise rejected: ' + (e.reason?.message || e.reason || 'unknown')));
 
-      // Подставим watermark из URL (?wm=...), если открыт через бота с параметром
+      // Подхват watermark из URL (?wm=...)
       try {
         const sp = new URLSearchParams(location.search);
         const wm = sp.get('wm');
@@ -98,7 +105,6 @@
 
           if (!ffmpeg.isLoaded()) {
             await ffmpeg.load();
-            // Шрифт загрузим с CDN (CORS-совместим)
             const fontResp = await fetch('https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts@version_2_37/ttf/DejaVuSans-Bold.ttf');
             if (!fontResp.ok) throw new Error('Не удалось загрузить шрифт');
             const fontBuf = await fontResp.arrayBuffer();
