@@ -29,7 +29,7 @@
     <div class="diag" id="diag">Загрузка…</div>
 
     <label class="filepick">
-      <input id="file" type="file" accept="video/*" capture="environment" />
+<input id="file" type="file" accept="video/*,video/mp4,video/quicktime" />
       <span>Выбрать видео</span>
     </label>
 
@@ -90,12 +90,27 @@
         if (wm) $wm.value = wm;
       } catch (e) {}
 
-      $file.addEventListener('change', () => {
-        $go.disabled = !$file.files?.length;
-        $dl.style.display = 'none';
-        setErr('');
-        setLog($file.files?.length ? 'Файл выбран. Готов к обработке.' : '');
-      });
+     function updateUIAfterPick() {
+  const f = $file.files && $file.files[0];
+  if (f) {
+    setErr('');
+    setLog(`Файл выбран: ${f.name || 'video'} • ${(f.size/1048576).toFixed(1)} МБ`);
+    $go.disabled = false;
+    $dl.style.display = 'none';
+  } else {
+    $go.disabled = true;
+  }
+}
+
+// некоторые вебвью отдают файл с задержкой — проверим повторно через 300 мс
+function delayedCheck(){ setTimeout(updateUIAfterPick, 300); }
+
+// вместо одного обработчика — три
+$file.addEventListener('change', () => { updateUIAfterPick(); delayedCheck(); });
+$file.addEventListener('input',  () => { updateUIAfterPick(); });
+// на iOS иногда помогает снять фокус
+$file.addEventListener('click', () => { setTimeout(()=>document.activeElement && document.activeElement.blur(), 0); });
+
 
       $go.addEventListener('click', async () => {
         try {
